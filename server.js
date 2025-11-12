@@ -1,3 +1,12 @@
+// server.js
+// -----------------------------------------
+// Serveur d'authentification pour Fil Info
+// - Codes autorisés lus depuis codes.json
+// - 1 code = 1 machine (liaison persistée)
+// - Tolérant casse/espaces/Unicode sur la saisie
+// - Endpoints admin (bindings + reset-code)
+// -----------------------------------------
+
 import express from "express";
 import cors from "cors";
 import bodyParser from "body-parser";
@@ -7,18 +16,48 @@ import { v4 as uuidv4 } from "uuid";
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// 1) Codes autorisés (ne sont connus QUE du serveur)
-const ALLOWED_CODES = {
-  // "identifiant logiquement lisible": "code réel"
-  "user1": "ABC123",
-  "user2": "DEF456",
-  "admin": "SUPER2025"
-};
+/* ============================
+   CODES AUTORISÉS (codes.json)
+   - Par défaut: ./codes.json (à la racine du repo)
+   - Surchargable via: process.env.CODES_FILE
+============================ */
+const CODES_FILE = process.env.CODES_FILE || "./codes.json";
 
-// 2) Fichier où on stocke les liaisons code <-> fingerprint <-> token
-const BINDINGS_FILE = "./bindings.json";
+function ensureCodesFile() {
+  if (!fs.existsSync(CODES_FILE)) {
+    // Fichier minimal si absent
+    fs.writeFileSync(CODES_FILE, JSON.stringify(["ABC123"], null, 2), "utf8");
+  }
+}
 
-// charge ou init le store
+function loadCodes() {
+  ensureCodesFile();
+  try {
+    const raw = fs.readFileSync(CODES_FILE, "utf8");
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+// Normalisation: retire espaces, casse non sensible, normalise Unicode
+function normalizeCode(c) {
+  return (c || "")
+    .toString()
+    .normalize("NFKC")
+    .replace(/\s+/g, "")
+    .toUpperCase();
+}
+
+/* ============================
+   BINDINGS (liaisons code <-> device <-> token)
+   - Par défaut: ./bindings.json (non persistant sur Render en plan gratuit)
+   - Surchargable via: process.env.BINDINGS_FILE
+   - Si vous voulez la vraie persistance Render: utilisez un Disk et /data/bindings.json
+============================ */
+const BINDINGS_FILE = process.env.BINDINGS_FILE || "./bindings.json";
+
 function loadBindings() {
   if (!fs.existsSync(BINDINGS_FILE)) {
     fs.writeFileSync(BINDINGS_FILE, JSON.stringify({}), "utf8");
@@ -35,23 +74,35 @@ function saveBindings(bindings) {
   fs.writeFileSync(BINDINGS_FILE, JSON.stringify(bindings, null, 2), "utf8");
 }
 
+/* ============================
+   MIDDLEWARES
+============================ */
 app.use(cors({
-  origin: true,          // en prod : remplace par ton domaine précis
+  // En production, restreignez à votre domaine Netlify:
+  // origin: "https://votre-site.netlify.app"
+  origin: true,
   credentials: false
 }));
 app.use(bodyParser.json());
 
-// Simple test: GET /api/auth -> permet de vérifier que le serveur répond
-app.get("/api/auth", (req, res) => {
-  res.json({ ok: true, message: "Fil info auth server is running. Use POST for auth." });
+/* ============================
+   HEALTHCHECK
+============================ */
+app.get("/", (req, res) => {
+  res.send("OK - utilisez /api/auth (POST).");
 });
 
+app.get("/api/auth", (req, res) => {
+  res.json({ ok: true, message: "Le serveur d'authentification des fichiers est en cours d'exécution. Utilisez POST pour l'authentification." });
+});
 
-// ---------- ROUTE D'AUTH ----------
-// POST /api/auth
-// body:
-//   - soit { token, fingerprint }
-//   - soit { code, fingerprint }
+/* ============================
+   AUTH
+   POST /api/auth
+   body:
+     - soit { token, fingerprint }
+     - soit { code, fingerprint }
+============================ */
 app.post("/api/auth", (req, res) => {
   const { token, fingerprint, code } = req.body || {};
   if (!fingerprint || typeof fingerprint !== "string") {
@@ -60,7 +111,7 @@ app.post("/api/auth", (req, res) => {
 
   let bindings = loadBindings();
 
-  // --- 1) Vérif par token (session déjà liée) ---
+  // 1) Vérification par token (session déjà liée)
   if (token) {
     const found = Object.values(bindings).find(b => b.token === token);
     if (!found) {
@@ -69,30 +120,32 @@ app.post("/api/auth", (req, res) => {
     if (found.fingerprint !== fingerprint) {
       return res.status(403).json({ ok: false, error: "Token does not match this device" });
     }
-    // OK : accès autorisé
     return res.json({ ok: true, mode: "token" });
   }
 
-  // --- 2) Vérif par code (nouvel accès ou revalidation) ---
+  // 2) Vérification par code (nouvel accès)
   if (!code || typeof code !== "string") {
     return res.status(400).json({ ok: false, error: "Missing code" });
   }
 
-  // Le code fait-il partie des ALLOWED_CODES ?
-  const isAllowed = Object.values(ALLOWED_CODES).includes(code);
+  // Lecture des codes depuis codes.json + normalisation
+  const codes = loadCodes().map(normalizeCode);
+  const entered = normalizeCode(code);
+
+  const isAllowed = codes.includes(entered);
   if (!isAllowed) {
     return res.status(401).json({ ok: false, error: "Bad code" });
   }
 
   // Ce code est-il déjà lié ?
-  const existingKey = Object.keys(bindings).find(k => bindings[k].code === code);
+  const existingKey = Object.keys(bindings).find(k => normalizeCode(bindings[k].code) === entered);
 
   if (!existingKey) {
-    // -> première utilisation : on lie ce code à ce fingerprint
+    // Première utilisation : on lie le code à ce device et on délivre un token
     const id = uuidv4();
     const newBinding = {
       id,
-      code,
+      code,               // on garde la forme d'origine
       fingerprint,
       token: uuidv4(),
       createdAt: new Date().toISOString()
@@ -106,9 +159,8 @@ app.post("/api/auth", (req, res) => {
     });
   }
 
-  // Il existe déjà un binding pour ce code
+  // Déjà lié
   const binding = bindings[existingKey];
-
   if (binding.fingerprint === fingerprint) {
     // Même machine : on renvoie le token existant
     return res.json({
@@ -118,28 +170,32 @@ app.post("/api/auth", (req, res) => {
     });
   }
 
-  // -> Machine différente : on refuse
+  // Machine différente -> refus
   return res.status(403).json({
     ok: false,
     error: "Ce code a déjà été utilisé sur un autre appareil."
   });
 });
 
-// ---------- ROUTE ADMIN OPTIONNELLE ----------
-// pour lister les bindings (à sécuriser si tu l'utilises en prod)
+/* ============================
+   ADMIN (facultatif)
+   - /api/admin/bindings : liste les liaisons
+   - /api/admin/reset-code : libère un code
+============================ */
 app.get("/api/admin/bindings", (req, res) => {
   const bindings = loadBindings();
   res.json(bindings);
 });
 
-// pour réinitialiser un code (ex: changement de poste)
 app.post("/api/admin/reset-code", (req, res) => {
   const { code } = req.body || {};
   if (!code) return res.status(400).json({ ok: false, error: "Missing code" });
+  const entered = normalizeCode(code);
+
   const bindings = loadBindings();
   let changed = false;
   for (const id of Object.keys(bindings)) {
-    if (bindings[id].code === code) {
+    if (normalizeCode(bindings[id].code) === entered) {
       delete bindings[id];
       changed = true;
     }
@@ -151,6 +207,7 @@ app.post("/api/admin/reset-code", (req, res) => {
   return res.status(404).json({ ok: false, error: "Code not found" });
 });
 
+/* ============================ */
 app.listen(PORT, () => {
   console.log(`Fil info auth server running on port ${PORT}`);
 });
